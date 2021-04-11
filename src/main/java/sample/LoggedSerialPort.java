@@ -3,6 +3,7 @@ package sample;
 import jssc.SerialPort;
 import jssc.SerialPortException;
 import jssc.SerialPortTimeoutException;
+import org.zeromq.ZMQ;
 
 import java.util.function.Consumer;
 
@@ -11,17 +12,31 @@ public class LoggedSerialPort extends SerialPort {
 
     private Consumer<String> logConsumer;
 
+    private ZMQ.Socket socket = null;
+
     public LoggedSerialPort(String portName, Consumer<String> log) {
         super(portName);
         this.logConsumer = log;
     }
 
+    public LoggedSerialPort(ZMQ.Socket socket, Consumer<String> log) {
+        super("");
+        this.socket = socket;
+        this.logConsumer = log;
+    }
+
     public boolean writeBytes(byte[] buffer) throws SerialPortException {
+        if (socket != null) {
+            return socket.send(buffer);
+        }
         logConsumer.accept(">" + bytesToHex(buffer) + " CRC: " + (checkCrc(buffer) ? "Ok" : "Fail"));
         return super.writeBytes(buffer);
     }
 
     public byte[] readBytes(int byteCount, int timeout) throws SerialPortException, SerialPortTimeoutException {
+        if (socket != null) {
+            return socket.recv();
+        }
         byte[] result = super.readBytes(byteCount, timeout);
         String desc = bytesToHex(result);
 
@@ -40,7 +55,7 @@ public class LoggedSerialPort extends SerialPort {
         return result;
     }
 
-    private boolean checkCrc(byte[] data) {
+    public static boolean checkCrc(byte[] data) {
         int sum = 0xFF;
         for (int i = 0; i < data.length - 1; i++) {
             sum -= data[i] & 0xFF;
@@ -50,7 +65,7 @@ public class LoggedSerialPort extends SerialPort {
         return crc == sum;
     }
 
-    private String bytesToHex(byte[] bytes) {
+    public static String bytesToHex(byte[] bytes) {
         char[] hexChars = new char[bytes.length * 2];
         for (int j = 0; j < bytes.length; j++) {
             int v = bytes[j] & 0xFF;

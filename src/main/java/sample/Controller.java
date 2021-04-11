@@ -1,5 +1,6 @@
 package sample;
 
+import javafx.application.Platform;
 import javafx.event.ActionEvent;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
@@ -8,6 +9,8 @@ import javafx.scene.layout.VBox;
 import jssc.SerialPort;
 import jssc.SerialPortException;
 import jssc.SerialPortList;
+import org.zeromq.ZContext;
+import org.zeromq.ZMQ;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -18,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.ResourceBundle;
+import java.util.function.Consumer;
 
 public class Controller implements Initializable {
 
@@ -136,11 +140,66 @@ public class Controller implements Initializable {
     @FXML
     private ListView<String> lstLog;
 
+    @FXML
+    private TextField edtPattern;
+
+    @FXML
+    private TextField edtOffset;
+
+    @FXML
+    private TextField edtAddress;
+
+    @FXML
+    private TextField edtSize;
+
+    @FXML
+    private TextField edtValue;
+
+    private ZMQ.Socket zmqMon = null;
+    private ZMQ.Socket zmqReq = null;
     @Override
     public void initialize(URL location, ResourceBundle resources) {
         List<String> ports = Arrays.asList(SerialPortList.getPortNames());
         cbxPort.getItems().addAll(ports);
+        cbxPort.getItems().add("ZMQ");
         lstLog.getItems().add("Starting app....");
+
+        Consumer<String> cons =  (log) ->
+            Platform.runLater(() -> {
+                int logSize = lstLog.getItems().size();
+                lstLog.getItems().add(log);
+                lstLog.scrollTo(logSize);
+            });
+
+        ZContext context = new ZContext(2);
+        zmqMon = context.createSocket(ZMQ.SUB);
+        zmqReq = context.createSocket(ZMQ.REQ);
+        zmqMon.connect("tcp://127.0.0.1:5556");
+        zmqReq.connect("tcp://127.0.0.1:5555");
+        zmqMon.subscribe("");
+        Thread t = new Thread(() -> {
+            while(true) {
+                byte packet[] = zmqMon.recv();
+                String desc = LoggedSerialPort.bytesToHex(packet);
+
+                int descSize = desc.length() - 10;
+                if (descSize > 4) {
+                    StringBuilder offsetString = new StringBuilder();
+                    offsetString.append("   Offsets   ");
+                    int offset = 5;
+                    while (offsetString.length() < descSize) {
+                        offsetString.append(String.format("%3d  ", offset));
+                        offset += 2;
+                    }
+                    cons.accept(offsetString.toString());
+                }
+                cons.accept("<" + desc + " CRC: " + (LoggedSerialPort.checkCrc(packet) ? "Ok" : "Fail"));
+            }
+        });
+        t.setDaemon(true);
+        t.setName("Mon");
+        t.start();
+
     }
 
     @FXML
@@ -152,8 +211,36 @@ public class Controller implements Initializable {
             lstResult.getItems().add(desc);
         });
     }
+    public static byte calcCrc(byte[] data) {
+        int sum = 0xFF;
+        for (int i = 0; i < data.length - 1; i++) {
+            sum -= data[i] & 0xFF;
+        }
+        sum &= 0xFF;
+        return (byte) sum;
+    }
 
     @FXML
+    public void doCustom(ActionEvent e) {
+        int addr = Integer.parseInt(edtAddress.getText(), 16);
+        int size = Integer.parseInt(edtSize.getText());
+        byte pack[] = {
+                (byte) 0x0D, (byte) 0x77, (byte) 0x01, (byte) 0x05, (byte) 0x06, (byte) 0x00,
+                /* req*/ (byte) 0x01, /* req*/ (byte) 0x00, (byte) 0x02, (byte) 0x6C /*crc*/
+        };
+        pack[8]=(byte)size;
+        byte b1 = (byte) (addr & 0xFF);
+        byte b2 = (byte) ((addr >> 8) & 0xFF);
+        pack[7] = b1;
+        pack[6] = b2;
+        pack[9] = calcCrc(pack);
+        runOnPort((port) -> {
+            port.writeBytes(pack);
+            port.readBytes(10, 1000);
+        });
+    }
+
+            @FXML
     public void doDate(ActionEvent e) {
         runOnPort((port) -> {
             port.writeBytes(REQ_DATE);
@@ -253,6 +340,35 @@ public class Controller implements Initializable {
     public void doClear(ActionEvent e) {
         lstResult.getItems().clear();
         lstLog.getItems().clear();
+    }
+
+    @FXML
+    public void doPattern(ActionEvent e) {
+        byte offset = Byte.parseByte(edtOffset.getText());
+
+        ByteBuffer bb = ByteBuffer.allocate(6);
+        bb.put(0, (byte)-1);
+        bb.put(1, offset);
+
+        int i = Integer.parseInt(edtPattern.getText(), 16);
+//        int j = i & 0xFF00;
+//        j = j >> 8;
+//        i = i << 8;
+//        i = i | j;
+        short s = (short) (i & 0xFFFF);
+
+        bb.putShort(2, s);
+
+        i = Integer.parseInt(edtValue.getText(), 16);
+//        j = i & 0xFF00;
+//        j = j >> 8;
+//        i = i << 8;
+//        i = i | j;
+        s = (short) (i & 0xFFFF);
+        bb.putShort(4, s);
+
+        zmqReq.send(bb.array());
+        zmqReq.recv();
     }
 
     @FXML
@@ -500,31 +616,45 @@ public class Controller implements Initializable {
             showError("Can not read command", new NullPointerException("No port selected"));
             return;
         }
-        SerialPort serialPort = new LoggedSerialPort(portName, (log) -> {
+
+        Consumer<String> logger = (log) -> {
             int logSize = lstLog.getItems().size();
             lstLog.getItems().add(log);
             lstLog.scrollTo(logSize);
-        });
+        };
+
+        SerialPort serialPort;
+        if ("ZMQ".equals(portName)) {
+            serialPort = new LoggedSerialPort(zmqReq, logger);
+        } else {
+            serialPort = new LoggedSerialPort(portName, logger);
+        }
 
 
         try {
-            serialPort.openPort();
-            serialPort.setParams(SerialPort.BAUDRATE_9600,
-                    SerialPort.DATABITS_8,
-                    SerialPort.STOPBITS_1,
-                    SerialPort.PARITY_NONE);
-            serialPort.setFlowControlMode(SerialPort.FLOWCONTROL_NONE);
+            if (!"ZMQ".equals(portName)) {
+                serialPort.openPort();
+                serialPort.setParams(SerialPort.BAUDRATE_9600,
+                        SerialPort.DATABITS_8,
+                        SerialPort.STOPBITS_1,
+                        SerialPort.PARITY_NONE);
+                serialPort.setFlowControlMode(SerialPort.FLOWCONTROL_NONE);
+            }
 
             func.accept(serialPort);
 
-            serialPort.closePort();
+            if (!"ZMQ".equals(portName)) {
+                serialPort.closePort();
+            }
         } catch (Exception serialPortException) {
             showError("Can not read command", serialPortException);
-            if (serialPort != null && serialPort.isOpened()) {
-                try {
-                    serialPort.closePort();
-                } catch (SerialPortException ex) {
-                    serialPortException.printStackTrace();
+            if (!"ZMQ".equals(portName)) {
+                if (serialPort != null && serialPort.isOpened()) {
+                    try {
+                        serialPort.closePort();
+                    } catch (SerialPortException ex) {
+                        serialPortException.printStackTrace();
+                    }
                 }
             }
         }
